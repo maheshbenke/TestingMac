@@ -1,0 +1,99 @@
+Sub RemoveEmptyRowsAndFillEmptyCells()
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim row As Long
+    Dim col As Long
+    Dim lastFilledRow As Long
+    Dim isEmpty As Boolean
+
+    ' Set the worksheet
+    Set ws = ThisWorkbook.Sheets("Sheet1") ' Change "Sheet1" to your sheet name
+
+    ' Find the last row with data in Column A
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).row
+
+    ' Loop through each row from the last row to row 30 to remove empty rows
+    For row = lastRow To 30 Step -1
+        isEmpty = True
+        ' Check if the entire row is empty
+        For col = 1 To 13 ' Only check columns A to M
+            If ws.Cells(row, col).Value <> "" Then
+                isEmpty = False
+                Exit For
+            End If
+        Next col
+        ' If the row is empty, delete it
+        If isEmpty Then
+            On Error Resume Next
+            ws.Rows(row).Delete
+            On Error GoTo 0
+        End If
+    Next row
+
+    ' Update lastRow after removing empty rows
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).row
+
+    ' Loop through each row from row 30 to the last row to fill empty cells
+    For row = 30 To lastRow
+        ' Loop through each column from A to D (1 to 4)
+        For col = 1 To 4
+            ' Check if the cell is empty
+            If ws.Cells(row, col).Value = "" Then
+                ' Find the last filled row in the same column
+                lastFilledRow = row - 1
+                Do While ws.Cells(lastFilledRow, col).Value = "" And lastFilledRow > 1
+                    lastFilledRow = lastFilledRow - 1
+                Loop
+                ' Replace the empty cell with the value from the last filled row
+                If lastFilledRow > 0 Then
+                    ws.Cells(row, col).Value = ws.Cells(lastFilledRow, col).Value
+                End If
+            End If
+        Next col
+    Next row
+
+    ' Create a Pivot Table
+    Dim pivotTable As pivotTable
+    Dim pivotCache As pivotCache
+    Dim pivotRange As Range
+    Dim pivotSheet As Worksheet
+
+    ' Set the range for the Pivot Table from A29 to the end of the table
+    Dim lastCol As Long
+    lastCol = ws.Cells(29, ws.Columns.Count).End(xlToLeft).Column
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).row
+    Set pivotRange = ws.Range(ws.Cells(29, 1), ws.Cells(lastRow, lastCol))
+
+    ' Add a new worksheet for the Pivot Table
+    Set pivotSheet = ThisWorkbook.Sheets.Add
+    On Error Resume Next
+    pivotSheet.Name = "PivotTableSheet" ' Change the name as needed
+    On Error GoTo 0
+
+    ' Create the Pivot Cache
+    Set pivotCache = ThisWorkbook.PivotCaches.Create( _
+        SourceType:=xlDatabase, _
+        SourceData:=pivotRange.Address)
+
+    ' Create the Pivot Table
+    Set pivotTable = pivotCache.CreatePivotTable( _
+        TableDestination:=pivotSheet.Cells(1, 1), _
+        TableName:="PivotTable")
+
+    ' Configure the Pivot Table
+    With pivotTable
+        On Error Resume Next
+        .PivotFields("Payment type").Orientation = xlRowField ' Ensure "Payment type" matches your actual column header
+        On Error GoTo 0
+    End With
+
+    ' Debugging: Check if the Pivot Table was created
+    If pivotTable Is Nothing Then
+        MsgBox "Pivot Table was not created. Please check the field names and data range."
+    Else
+        MsgBox "Pivot Table created successfully."
+    End If
+End Sub
+
+
+
