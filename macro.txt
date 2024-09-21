@@ -7,7 +7,7 @@ Sub RemoveEmptyRowsAndFillEmptyCells()
     Dim isEmpty As Boolean
 
     ' Set the worksheet
-    Set ws = ThisWorkbook.Sheets("Sheet1") ' Change "Sheet1" to your sheet name
+    Set ws = ThisWorkbook.Sheets("Bill Report") ' Change "Sheet1" to your sheet name
 
     ' Find the last row with data in Column A
     lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).row
