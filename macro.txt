@@ -16,7 +16,7 @@ Sub RemoveEmptyRowsAndFillEmptyCells()
     For row = lastRow To 30 Step -1
         isEmpty = True
         ' Check if the entire row is empty
-        For col = 1 To 13 ' Only check columns A to M
+        For col = 1 To 100 ' Only check columns A to *
             If ws.Cells(row, col).Value <> "" Then
                 isEmpty = False
                 Exit For
