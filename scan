@@ -1,0 +1,292 @@
+scan
+
+<#
+.SYNOPSIS
+    Scans Microsoft Outlook inbox and exports email metadata + context to JSON
+    for offline AI/Copilot prioritization.
+
+.DESCRIPTION
+    Connects to Outlook via COM, reads recent emails from Inbox (and optionally
+    other folders), and writes a rich JSON file with enough context for an AI
+    assistant to rank emails by priority.
+
+.NOTES
+    Outlook must be installed and configured with at least one mail profile.
+    Run as the same user who owns the Outlook profile.
+#>
+
+[CmdletBinding()]
+param(
+    # How many hours back to scan (default: 24 so first run captures a full day)
+    [int]$HoursBack = 24,
+
+    # Max emails to export per folder
+    [int]$MaxPerFolder = 500,
+
+    # Output directory (defaults to script directory)
+    [string]$OutputDir = $PSScriptRoot,
+
+    # Additional folder names to scan beyond Inbox
+    [string[]]$ExtraFolders = @(),
+
+    # Whether to include the full email body (plain text, truncated)
+    [switch]$IncludeBody,
+
+    # Max characters of body text to capture per email
+    [int]$BodyMaxChars = 3000
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ── Constants ────────────────────────────────────────────────────────────────
+$OlFolderInbox        = 6
+$OlImportanceLow      = 0
+$OlImportanceNormal   = 1
+$OlImportanceHigh     = 2
+$OlFlagStatusFlagged  = 2
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+function Get-ImportanceLabel ([int]$val) {
+    switch ($val) {
+        $OlImportanceHigh   { 'High' }
+        $OlImportanceNormal { 'Normal' }
+        $OlImportanceLow    { 'Low' }
+        default             { 'Unknown' }
+    }
+}
+
+function Get-SafeString ([string]$s, [int]$max) {
+    if ([string]::IsNullOrEmpty($s)) { return '' }
+    if ($s.Length -le $max) { return $s }
+    return $s.Substring(0, $max) + '...[truncated]'
+}
+
+function Get-RecipientList ($recipients) {
+    $list = @()
+    for ($i = 1; $i -le $recipients.Count; $i++) {
+        $r = $recipients.Item($i)
+        $list += [PSCustomObject]@{
+            Name    = $r.Name
+            Address = $r.Address
+        }
+    }
+    return $list
+}
+
+function Get-AttachmentSummary ($attachments) {
+    $list = @()
+    for ($i = 1; $i -le $attachments.Count; $i++) {
+        $a = $attachments.Item($i)
+        $list += [PSCustomObject]@{
+            FileName = $a.FileName
+            Size     = $a.Size
+        }
+    }
+    return $list
+}
+
+function Get-FolderTree ($folder, [string]$basePath) {
+    # Returns a flat list of { Name (full path); Folder } for the given folder
+    # and all of its subfolders, recursively.
+    $result = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $result.Add([PSCustomObject]@{ Name = $basePath; Folder = $folder })
+    for ($i = 1; $i -le $folder.Folders.Count; $i++) {
+        $sub     = $folder.Folders.Item($i)
+        $subPath = "$basePath\$($sub.Name)"
+        foreach ($item in (Get-FolderTree $sub $subPath)) {
+            $result.Add($item)
+        }
+    }
+    return $result
+}
+
+function ConvertTo-EmailRecord ($mail) {
+    <#
+        Build a rich record with every signal useful for priority ranking:
+        - sender, recipients, CC
+        - subject, categories, importance, flag status
+        - timestamps (sent, received)
+        - conversation metadata (thread ID, count)
+        - attachment info
+        - preview / full body (plain text)
+        - read/unread status
+        - whether the current user is on To vs CC
+    #>
+    try {
+        $record = [ordered]@{
+            # ── Identity ──
+            EntryID          = $mail.EntryID
+            ConversationID   = $mail.ConversationID
+            ConversationTopic= $mail.ConversationTopic
+
+            # ── People ──
+            SenderName       = $mail.SenderName
+            SenderEmail      = $mail.SenderEmailAddress
+            ToRecipients     = @(Get-RecipientList $mail.Recipients | Where-Object { $true })  # all recipients
+            ToLine           = $mail.To
+            CCLine           = $mail.CC
+            BCCLine          = $mail.BCC
+
+            # ── Content ──
+            Subject          = $mail.Subject
+            Categories       = $mail.Categories
+            Importance       = Get-ImportanceLabel $mail.Importance
+            FlagStatus       = if ($mail.FlagRequest) { $mail.FlagRequest } else { 'None' }
+            IsFlagged        = ($mail.FlagStatus -eq $OlFlagStatusFlagged)
+
+            # ── Timestamps ──
+            ReceivedTime     = if ($mail.ReceivedTime) { $mail.ReceivedTime.ToString('o') } else { $null }
+            SentOn           = if ($mail.SentOn)       { $mail.SentOn.ToString('o') }       else { $null }
+            CreationTime     = if ($mail.CreationTime)  { $mail.CreationTime.ToString('o') }  else { $null }
+
+            # ── Status ──
+            IsRead           = [bool]$mail.UnRead -eq $false
+            Size             = $mail.Size
+            HasAttachments   = $mail.Attachments.Count -gt 0
+            AttachmentCount  = $mail.Attachments.Count
+            Attachments      = @(Get-AttachmentSummary $mail.Attachments)
+
+            # ── Body preview ──
+            BodyPreview      = Get-SafeString $mail.Body 500
+        }
+
+        # Optionally include the longer body
+        if ($IncludeBody) {
+            $record['BodyText'] = Get-SafeString $mail.Body $BodyMaxChars
+        }
+
+        return $record
+    }
+    catch {
+        Write-Warning "Skipping mail (EntryID fragment: $($mail.EntryID.Substring(0,20))...): $_"
+        return $null
+    }
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+Write-Host "Starting Outlook scan at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+
+# Connect to Outlook
+try {
+    $outlook = [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')
+    Write-Host "Attached to running Outlook instance."
+}
+catch {
+    Write-Host "No running Outlook found. Launching COM..."
+    $outlook = New-Object -ComObject Outlook.Application
+}
+
+$namespace = $outlook.GetNamespace('MAPI')
+$cutoff    = (Get-Date).AddHours(-$HoursBack)
+$cutoffStr = $cutoff.ToString('MM/dd/yyyy HH:mm')
+
+# Build list of folders to scan (Inbox + all subfolders, recursively)
+$inboxFolder   = $namespace.GetDefaultFolder($OlFolderInbox)
+$foldersToScan = @(Get-FolderTree $inboxFolder 'Inbox')
+Write-Host "Found $($foldersToScan.Count) folder(s) under Inbox (including subfolders)."
+
+foreach ($name in $ExtraFolders) {
+    try {
+        $inbox = $namespace.GetDefaultFolder($OlFolderInbox)
+        # Try as subfolder of Inbox first, then root
+        try {
+            $f = $inbox.Folders.Item($name)
+        }
+        catch {
+            $f = $namespace.Folders.Item(1).Folders.Item($name)
+        }
+        # Add the extra folder and all of its subfolders
+        foreach ($item in (Get-FolderTree $f $name)) {
+            $foldersToScan += $item
+        }
+    }
+    catch {
+        Write-Warning "Could not find folder '$name' – skipping."
+    }
+}
+
+$allEmails = @()
+
+foreach ($entry in $foldersToScan) {
+    $folder = $entry.Folder
+    $fname  = $entry.Name
+    Write-Host "Scanning folder: $fname ..."
+
+    $items = $folder.Items
+    $items.Sort('[ReceivedTime]', $true)  # newest first
+
+    # DASL filter for date range
+    $filter = "[ReceivedTime] >= '$cutoffStr'"
+    $filtered = $items.Restrict($filter)
+
+    $count = 0
+    $mail = $filtered.GetFirst()
+    while ($mail -ne $null -and $count -lt $MaxPerFolder) {
+        # Only process MailItem objects (class 43)
+        if ($mail.Class -eq 43) {
+            $rec = ConvertTo-EmailRecord $mail
+            if ($rec) {
+                $rec['Folder'] = $fname
+                $allEmails += $rec
+                $count++
+            }
+        }
+        $mail = $filtered.GetNext()
+    }
+    Write-Host "  Exported $count emails from $fname."
+}
+
+# ── Build output ─────────────────────────────────────────────────────────────
+
+$scanResult = [ordered]@{
+    ScanMetadata = [ordered]@{
+        GeneratedAt    = (Get-Date).ToString('o')
+        Computer       = $env:COMPUTERNAME
+        User           = $env:USERNAME
+        OutlookProfile = $namespace.CurrentProfileName
+        HoursBack      = $HoursBack
+        CutoffTime     = $cutoff.ToString('o')
+        TotalEmails    = $allEmails.Count
+        FoldersScanned = $foldersToScan | ForEach-Object { $_.Name }
+    }
+
+    # Summary statistics to help Copilot quickly orient
+    Summary = [ordered]@{
+        TotalUnread          = @($allEmails | Where-Object { -not $_.IsRead }).Count
+        TotalFlagged         = @($allEmails | Where-Object { $_.IsFlagged }).Count
+        TotalHighImportance  = @($allEmails | Where-Object { $_.Importance -eq 'High' }).Count
+        TotalWithAttachments = @($allEmails | Where-Object { $_.HasAttachments }).Count
+        TopSenders           = @($allEmails | Group-Object SenderName | Sort-Object Count -Descending | Select-Object -First 10 Name, Count)
+        TopConversations     = @($allEmails | Group-Object ConversationTopic | Sort-Object Count -Descending | Select-Object -First 10 Name, Count)
+    }
+
+    # Full email records
+    Emails = $allEmails
+}
+
+# Write JSON with timestamp in filename
+$timestamp = (Get-Date).ToString('yyyy-MM-dd_HHmmss')
+$outPath = Join-Path $OutputDir "outlook_emails_$timestamp.json"
+$scanResult | ConvertTo-Json -Depth 10 -Compress:$false | Out-File -FilePath $outPath -Encoding UTF8 -Force
+
+# Also maintain a "latest" copy so Copilot always knows which file to read
+$latestPath = Join-Path $OutputDir 'outlook_emails_latest.json'
+Copy-Item -Path $outPath -Destination $latestPath -Force
+
+Write-Host "`nScan complete. $($allEmails.Count) emails written to: $outPath"
+Write-Host "Latest copy: $latestPath"
+Write-Host "File size: $([math]::Round((Get-Item $outPath).Length / 1KB, 1)) KB"
+
+# Also write a small "latest scan" timestamp file Copilot can check quickly
+$tsPath = Join-Path $OutputDir 'last_scan.txt'
+@"
+LastScan=$((Get-Date).ToString('o'))
+Emails=$($allEmails.Count)
+Unread=$(@($allEmails | Where-Object { -not $_.IsRead }).Count)
+Flagged=$(@($allEmails | Where-Object { $_.IsFlagged }).Count)
+HighImportance=$(@($allEmails | Where-Object { $_.Importance -eq 'High' }).Count)
+"@ | Out-File -FilePath $tsPath -Encoding UTF8 -Force
+
