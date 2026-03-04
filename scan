@@ -1,4 +1,3 @@
-
 <#
 .SYNOPSIS
     Scans Microsoft Outlook inbox and exports email metadata + context to JSON
@@ -101,7 +100,7 @@ function Get-FolderTree ($folder, [string]$basePath) {
     return $result
 }
 
-function ConvertTo-EmailRecord ($mail) {
+function ConvertTo-EmailRecord ($mail, [string]$folderPath) {
     <#
         Build a rich record with every signal useful for priority ranking:
         - sender, recipients, CC
@@ -115,6 +114,9 @@ function ConvertTo-EmailRecord ($mail) {
     #>
     try {
         $record = [ordered]@{
+            # ── Location ──
+            Folder           = $folderPath
+
             # ── Identity ──
             EntryID          = $mail.EntryID
             ConversationID   = $mail.ConversationID
@@ -226,9 +228,8 @@ foreach ($entry in $foldersToScan) {
     while ($mail -ne $null -and $count -lt $MaxPerFolder) {
         # Only process MailItem objects (class 43)
         if ($mail.Class -eq 43) {
-            $rec = ConvertTo-EmailRecord $mail
+            $rec = ConvertTo-EmailRecord $mail $fname
             if ($rec) {
-                $rec['Folder'] = $fname
                 $allEmails += $rec
                 $count++
             }
@@ -288,4 +289,3 @@ Unread=$(@($allEmails | Where-Object { -not $_.IsRead }).Count)
 Flagged=$(@($allEmails | Where-Object { $_.IsFlagged }).Count)
 HighImportance=$(@($allEmails | Where-Object { $_.Importance -eq 'High' }).Count)
 "@ | Out-File -FilePath $tsPath -Encoding UTF8 -Force
-
